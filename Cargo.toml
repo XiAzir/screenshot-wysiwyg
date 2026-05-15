@@ -26,9 +26,12 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
-image = "0.24"
+image = { version = "0.24", default-features = false, features = ["png"] }
 anyhow = "1"
 
 [profile.release]
 opt-level = 3
 lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

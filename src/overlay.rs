@@ -1,4 +1,4 @@
-use crate::capture;
+use crate::capture::DesktopSnapshot;
 use anyhow::{anyhow, Context, Result};
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -18,14 +18,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumWindows, GetClassNameW, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
-    GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, LoadCursorW, RegisterClassW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_EXSTYLE, HTCLIENT, IDC_ARROW, MSG,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW,
-    ULW_ALPHA, WM_CLOSE, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    EnumWindows, GetClassNameW, GetCursorPos, GetWindowLongPtrW, GetWindowLongW, GetWindowRect,
+    IsIconic, IsWindowVisible, LoadCursorW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
+    ShowWindow, TranslateMessage, UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    GWLP_USERDATA, GWL_EXSTYLE, HTCLIENT, IDC_ARROW, MSG, SW_HIDE, SW_SHOW, ULW_ALPHA, WM_CLOSE,
+    WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const CLASS_NAME: windows::core::PCWSTR = w!("WysiwygScreenshotOverlay");
@@ -34,8 +32,8 @@ const HOTKEY_ESCAPE_ID: i32 = 702;
 const HANDLE_SIZE: i32 = 8;
 const HIT_PAD: i32 = 8;
 const MIN_SIZE: i32 = 6;
-const SELECT_ALPHA: u8 = 1;
-const DIM_ALPHA: u8 = 77;
+const DIM_NUMERATOR: u16 = 166;
+const DIM_DENOMINATOR: u16 = 255;
 const BORDER_R: u8 = 255;
 const BORDER_G: u8 = 215;
 const BORDER_B: u8 = 0;
@@ -67,6 +65,10 @@ struct OverlayState {
     hwnd: HWND,
     bounds: RECT,
     monitor_rects: Vec<RECT>,
+    window_rects: Vec<RECT>,
+    frozen_bgra: Vec<u8>,
+    frozen_width: usize,
+    frozen_height: usize,
     selection: RECT,
     mode: Mode,
     drag: Drag,
@@ -76,16 +78,33 @@ struct OverlayState {
     result: Option<RECT>,
 }
 
-pub fn select_region() -> Result<Option<RECT>> {
-    let bounds = virtual_screen_rect()?;
-    let monitor_rects = monitor_rects().unwrap_or_else(|_| vec![bounds]);
+pub fn select_region(snapshot: &DesktopSnapshot) -> Result<Option<RECT>> {
+    let bounds = snapshot.bounds;
+    let monitor_rects = if snapshot.monitor_rects.is_empty() {
+        vec![bounds]
+    } else {
+        snapshot.monitor_rects.clone()
+    };
+    let window_rects = snapshot_window_rects();
     let initial_selection = cursor_screen_point()
-        .and_then(|pt| monitor_rect_at_point(pt, &monitor_rects))
+        .and_then(|pt| {
+            window_rect_at_point(pt, &window_rects)
+                .or_else(|| monitor_rect_at_point(pt, &monitor_rects))
+        })
         .unwrap_or(bounds);
+
     let mut state = Box::new(OverlayState {
         hwnd: HWND::default(),
         bounds,
         monitor_rects,
+        window_rects,
+        frozen_bgra: rgba_to_bgra(
+            &snapshot.image.data,
+            snapshot.image.width,
+            snapshot.image.height,
+        )?,
+        frozen_width: snapshot.image.width as usize,
+        frozen_height: snapshot.image.height as usize,
         selection: initial_selection,
         mode: Mode::Picking,
         drag: Drag::None,
@@ -130,7 +149,7 @@ pub fn select_region() -> Result<Option<RECT>> {
     .context("创建截图选区窗口失败")?;
 
     state.hwnd = hwnd;
-    render_layered_overlay(&state).context("绘制截图选区窗口失败")?;
+    render_layered_overlay(&state).context("绘制冻结画面失败")?;
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = BringWindowToTop(hwnd);
@@ -156,7 +175,9 @@ pub fn select_region() -> Result<Option<RECT>> {
         if state.done {
             break;
         }
-        let ret = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
+        let ret = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, HWND::default(), 0, 0)
+        };
         if ret.0 <= 0 {
             state.done = true;
             break;
@@ -286,9 +307,10 @@ fn handle_mouse_move(state: &mut OverlayState, pt: POINT) {
     match state.drag {
         Drag::None => {
             if state.mode == Mode::Picking {
-                state.selection = window_rect_at_point(pt, state.hwnd).unwrap_or_else(|| {
-                    monitor_rect_at_point(pt, &state.monitor_rects).unwrap_or(state.bounds)
-                });
+                state.selection =
+                    window_rect_at_point(pt, &state.window_rects).unwrap_or_else(|| {
+                        monitor_rect_at_point(pt, &state.monitor_rects).unwrap_or(state.bounds)
+                    });
                 state.selection = clamp_rect(state.selection, state.bounds);
             }
         }
@@ -348,31 +370,11 @@ fn finish_drag(state: &mut OverlayState, pt: POINT) {
 }
 
 fn render_layered_overlay(state: &OverlayState) -> Result<()> {
-    let width = state.bounds.right - state.bounds.left;
-    let height = state.bounds.bottom - state.bounds.top;
-    if width <= 0 || height <= 0 {
-        return Err(anyhow!("截图选区窗口尺寸无效"));
+    if state.frozen_width == 0 || state.frozen_height == 0 {
+        return Err(anyhow!("冻结画面尺寸无效"));
     }
 
-    let width_usize = width as usize;
-    let height_usize = height as usize;
-    let mut pixels = vec![0u8; width_usize * height_usize * 4];
-    fill_rect_bgra(
-        &mut pixels,
-        width_usize,
-        height_usize,
-        RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: height,
-        },
-        0,
-        0,
-        0,
-        SELECT_ALPHA,
-    );
-
+    let mut pixels = state.frozen_bgra.clone();
     let mut local = normalize_rect(state.selection);
     local.left -= state.bounds.left;
     local.right -= state.bounds.left;
@@ -383,8 +385,8 @@ fn render_layered_overlay(state: &OverlayState) -> Result<()> {
         RECT {
             left: 0,
             top: 0,
-            right: width,
-            bottom: height,
+            right: state.frozen_width as i32,
+            bottom: state.frozen_height as i32,
         },
     );
 
@@ -392,26 +394,25 @@ fn render_layered_overlay(state: &OverlayState) -> Result<()> {
         RECT {
             left: 0,
             top: 0,
-            right: width,
-            bottom: height,
+            right: state.frozen_width as i32,
+            bottom: state.frozen_height as i32,
         },
         local,
     ) {
-        fill_rect_bgra(
-            &mut pixels,
-            width_usize,
-            height_usize,
-            rect,
-            0,
-            0,
-            0,
-            DIM_ALPHA,
-        );
+        dim_rect_bgra(&mut pixels, state.frozen_width, state.frozen_height, rect);
     }
 
-    draw_selection_frame(&mut pixels, width_usize, height_usize, local);
+    draw_selection_frame(&mut pixels, state.frozen_width, state.frozen_height, local);
 
-    unsafe { update_layered_bitmap(state.hwnd, state.bounds, width, height, &mut pixels) }
+    unsafe {
+        update_layered_bitmap(
+            state.hwnd,
+            state.bounds,
+            state.frozen_width as i32,
+            state.frozen_height as i32,
+            &mut pixels,
+        )
+    }
 }
 
 unsafe fn update_layered_bitmap(
@@ -504,16 +505,23 @@ unsafe fn update_layered_bitmap(
     result
 }
 
-fn fill_rect_bgra(
-    pixels: &mut [u8],
-    width: usize,
-    height: usize,
-    rect: RECT,
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8,
-) {
+fn rgba_to_bgra(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let expected = width as usize * height as usize * 4;
+    if data.len() != expected {
+        return Err(anyhow!("冻结画面的像素数据大小不正确"));
+    }
+
+    let mut converted = Vec::with_capacity(expected);
+    for pixel in data.chunks_exact(4) {
+        converted.push(pixel[2]);
+        converted.push(pixel[1]);
+        converted.push(pixel[0]);
+        converted.push(255);
+    }
+    Ok(converted)
+}
+
+fn dim_rect_bgra(pixels: &mut [u8], width: usize, height: usize, rect: RECT) {
     let rect = clamp_rect(
         rect,
         RECT {
@@ -527,23 +535,44 @@ fn fill_rect_bgra(
         return;
     }
 
-    let pr = premultiply(r, a);
-    let pg = premultiply(g, a);
-    let pb = premultiply(b, a);
-
     for y in rect.top as usize..rect.bottom as usize {
         for x in rect.left as usize..rect.right as usize {
             let idx = (y * width + x) * 4;
-            pixels[idx] = pb;
-            pixels[idx + 1] = pg;
-            pixels[idx + 2] = pr;
-            pixels[idx + 3] = a;
+            pixels[idx] = scale_dim(pixels[idx]);
+            pixels[idx + 1] = scale_dim(pixels[idx + 1]);
+            pixels[idx + 2] = scale_dim(pixels[idx + 2]);
+            pixels[idx + 3] = 255;
         }
     }
 }
 
-fn premultiply(c: u8, a: u8) -> u8 {
-    ((c as u16 * a as u16 + 127) / 255) as u8
+fn scale_dim(channel: u8) -> u8 {
+    ((channel as u16 * DIM_NUMERATOR + DIM_DENOMINATOR / 2) / DIM_DENOMINATOR) as u8
+}
+
+fn fill_rect_bgra(pixels: &mut [u8], width: usize, height: usize, rect: RECT, r: u8, g: u8, b: u8) {
+    let rect = clamp_rect(
+        rect,
+        RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        },
+    );
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+
+    for y in rect.top as usize..rect.bottom as usize {
+        for x in rect.left as usize..rect.right as usize {
+            let idx = (y * width + x) * 4;
+            pixels[idx] = b;
+            pixels[idx + 1] = g;
+            pixels[idx + 2] = r;
+            pixels[idx + 3] = 255;
+        }
+    }
 }
 
 fn draw_selection_frame(pixels: &mut [u8], width: usize, height: usize, rect: RECT) {
@@ -562,7 +591,6 @@ fn draw_selection_frame(pixels: &mut [u8], width: usize, height: usize, rect: RE
         BORDER_R,
         BORDER_G,
         BORDER_B,
-        255,
     );
     fill_rect_bgra(
         pixels,
@@ -577,7 +605,6 @@ fn draw_selection_frame(pixels: &mut [u8], width: usize, height: usize, rect: RE
         BORDER_R,
         BORDER_G,
         BORDER_B,
-        255,
     );
     fill_rect_bgra(
         pixels,
@@ -592,7 +619,6 @@ fn draw_selection_frame(pixels: &mut [u8], width: usize, height: usize, rect: RE
         BORDER_R,
         BORDER_G,
         BORDER_B,
-        255,
     );
     fill_rect_bgra(
         pixels,
@@ -607,13 +633,10 @@ fn draw_selection_frame(pixels: &mut [u8], width: usize, height: usize, rect: RE
         BORDER_R,
         BORDER_G,
         BORDER_B,
-        255,
     );
 
     for handle in handle_rects(rect) {
-        fill_rect_bgra(
-            pixels, width, height, handle, BORDER_R, BORDER_G, BORDER_B, 255,
-        );
+        fill_rect_bgra(pixels, width, height, handle, BORDER_R, BORDER_G, BORDER_B);
     }
 }
 
@@ -647,43 +670,6 @@ fn dim_rects(client: RECT, selection: RECT) -> [RECT; 4] {
     ]
 }
 
-fn virtual_screen_rect() -> Result<RECT> {
-    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-
-    if width <= 0 || height <= 0 {
-        return Err(anyhow!("无法读取虚拟桌面尺寸"));
-    }
-
-    Ok(RECT {
-        left,
-        top,
-        right: left + width,
-        bottom: top + height,
-    })
-}
-
-fn monitor_rects() -> Result<Vec<RECT>> {
-    let monitors = capture::list_monitors()?;
-    let mut rects = Vec::with_capacity(monitors.len());
-    for monitor in monitors {
-        rects.push(RECT {
-            left: monitor.x,
-            top: monitor.y,
-            right: monitor.x + monitor.width as i32,
-            bottom: monitor.y + monitor.height as i32,
-        });
-    }
-
-    if rects.is_empty() {
-        Err(anyhow!("未找到显示器"))
-    } else {
-        Ok(rects)
-    }
-}
-
 fn monitor_rect_at_point(pt: POINT, monitor_rects: &[RECT]) -> Option<RECT> {
     monitor_rects
         .iter()
@@ -691,30 +677,21 @@ fn monitor_rect_at_point(pt: POINT, monitor_rects: &[RECT]) -> Option<RECT> {
         .find(|rect| point_in_rect(pt, *rect))
 }
 
-fn cursor_screen_point() -> Option<POINT> {
-    let mut pt = POINT::default();
-    unsafe { GetCursorPos(&mut pt).ok()? };
-    Some(pt)
+fn window_rect_at_point(pt: POINT, window_rects: &[RECT]) -> Option<RECT> {
+    window_rects
+        .iter()
+        .copied()
+        .find(|rect| point_in_rect(pt, *rect))
 }
 
-fn point_from_lparam(lparam: LPARAM, bounds: RECT) -> POINT {
-    let x = (lparam.0 & 0xffff) as u16 as i16 as i32 + bounds.left;
-    let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32 + bounds.top;
-    POINT { x, y }
-}
-
-fn window_rect_at_point(pt: POINT, ignore: HWND) -> Option<RECT> {
+fn snapshot_window_rects() -> Vec<RECT> {
     struct EnumData {
-        pt: POINT,
-        ignore: HWND,
-        found: Option<RECT>,
+        rects: Vec<RECT>,
     }
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let data = &mut *(lparam.0 as *mut EnumData);
-        if hwnd == data.ignore {
-            return BOOL(1);
-        }
+
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
             return BOOL(1);
         }
@@ -728,27 +705,32 @@ fn window_rect_at_point(pt: POINT, ignore: HWND) -> Option<RECT> {
             return BOOL(1);
         }
 
-        let mut rect = window_visible_rect(hwnd);
-        rect = normalize_rect(rect);
+        let rect = normalize_rect(window_visible_rect(hwnd));
         if rect.right - rect.left < 16 || rect.bottom - rect.top < 16 {
             return BOOL(1);
         }
-        if point_in_rect(data.pt, rect) {
-            data.found = Some(rect);
-            return BOOL(0);
-        }
+
+        data.rects.push(rect);
         BOOL(1)
     }
 
-    let mut data = EnumData {
-        pt,
-        ignore,
-        found: None,
-    };
+    let mut data = EnumData { rects: Vec::new() };
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut data as *mut _ as isize));
     }
-    data.found
+    data.rects
+}
+
+fn cursor_screen_point() -> Option<POINT> {
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt).ok()? };
+    Some(pt)
+}
+
+fn point_from_lparam(lparam: LPARAM, bounds: RECT) -> POINT {
+    let x = (lparam.0 & 0xffff) as u16 as i16 as i32 + bounds.left;
+    let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32 + bounds.top;
+    POINT { x, y }
 }
 
 unsafe fn is_shell_desktop_window(hwnd: HWND) -> bool {

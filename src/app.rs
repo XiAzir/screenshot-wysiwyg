@@ -376,17 +376,32 @@ impl AppState {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
+            thread::sleep(Duration::from_millis(16));
         }
 
-        self.set_status("选择截图区域");
-        let selection = overlay::select_region();
-        if let Err(err) = &selection {
+        let snapshot = capture::capture_desktop_snapshot();
+        if let Err(err) = &snapshot {
             self.show_error(&format!("{err:#}"));
+            if was_visible {
+                self.restore_from_tray();
+            }
+            return;
         }
+        let snapshot = snapshot.unwrap();
 
+        self.set_status("冻结画面，选择截图区域");
+        let selection = overlay::select_region(&snapshot);
         let selection = match selection {
             Ok(Some(rect)) => rect,
-            Ok(None) | Err(_) => {
+            Ok(None) => {
+                if was_visible {
+                    self.restore_from_tray();
+                }
+                self.set_status("截图已取消");
+                return;
+            }
+            Err(err) => {
+                self.show_error(&format!("{err:#}"));
                 if was_visible {
                     self.restore_from_tray();
                 }
@@ -395,9 +410,9 @@ impl AppState {
             }
         };
 
-        thread::sleep(Duration::from_millis(120));
-
-        match self.capture_and_output(selection) {
+        match capture::crop_snapshot(&snapshot, selection)
+            .and_then(|image| self.output_captured_image(&image))
+        {
             Ok(status) => self.set_status(&status),
             Err(err) => self.show_error(&format!("{err:#}")),
         }
@@ -407,8 +422,7 @@ impl AppState {
         }
     }
 
-    fn capture_and_output(&self, rect: windows::Win32::Foundation::RECT) -> Result<String> {
-        let image = capture::capture_region(rect)?;
+    fn output_captured_image(&self, image: &capture::CapturedImage) -> Result<String> {
         let mut parts = Vec::new();
 
         if self.settings.save_to_file {

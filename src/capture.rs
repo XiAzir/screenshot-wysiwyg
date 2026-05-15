@@ -1,10 +1,17 @@
 use anyhow::{anyhow, Context, Result};
+use std::ffi::c_void;
+use std::mem::size_of;
 use windows::core::*;
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, ROP_CODE,
+    SRCCOPY,
+};
 
 mod tone_map;
 
@@ -24,6 +31,7 @@ pub struct MonitorInfo {
 }
 
 /// 截图结果
+#[derive(Clone)]
 pub struct CapturedImage {
     pub width: u32,
     pub height: u32,
@@ -31,8 +39,48 @@ pub struct CapturedImage {
     pub is_hdr_source: bool,
 }
 
-/// 截取虚拟桌面中的指定区域。
-pub fn capture_region(rect: RECT) -> Result<CapturedImage> {
+/// 按下快捷键瞬间冻结下来的整张虚拟桌面图像。
+pub struct DesktopSnapshot {
+    pub bounds: RECT,
+    pub monitor_rects: Vec<RECT>,
+    pub image: CapturedImage,
+}
+
+/// 冻结当前整张虚拟桌面，后续所有选区和导出都基于这张静帧进行。
+pub fn capture_desktop_snapshot() -> Result<DesktopSnapshot> {
+    let monitors = list_monitors().context("扫描显示器失败")?;
+    let bounds = virtual_desktop_bounds(&monitors).ok_or_else(|| anyhow!("未找到任何显示器"))?;
+    let monitor_rects = monitors
+        .iter()
+        .map(|monitor| RECT {
+            left: monitor.x,
+            top: monitor.y,
+            right: monitor.x + monitor.width as i32,
+            bottom: monitor.y + monitor.height as i32,
+        })
+        .collect();
+    let image = capture_region_from_monitors(bounds, &monitors).or_else(|dxgi_err| {
+        capture_region_gdi(bounds)
+            .with_context(|| format!("DXGI 冻结失败: {dxgi_err:#}；GDI 兜底也失败"))
+    })?;
+
+    Ok(DesktopSnapshot {
+        bounds,
+        monitor_rects,
+        image,
+    })
+}
+
+/// 从冻结桌面中裁切出最终截图区域。
+pub fn crop_snapshot(snapshot: &DesktopSnapshot, rect: RECT) -> Result<CapturedImage> {
+    crop_captured_image(&snapshot.image, snapshot.bounds, rect)
+}
+
+pub fn crop_captured_image(
+    image: &CapturedImage,
+    image_rect: RECT,
+    rect: RECT,
+) -> Result<CapturedImage> {
     let left = rect.left.min(rect.right);
     let top = rect.top.min(rect.bottom);
     let right = rect.left.max(rect.right);
@@ -44,12 +92,63 @@ pub fn capture_region(rect: RECT) -> Result<CapturedImage> {
         return Err(anyhow!("截图区域为空"));
     }
 
-    let monitors = list_monitors().context("扫描显示器失败")?;
+    let image_rect = normalize_rect(image_rect);
+    let Some(intersection) = intersect_rect(
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        },
+        image_rect,
+    ) else {
+        return Err(anyhow!("截图区域不在冻结画面内"));
+    };
+
+    let crop_width = (intersection.right - intersection.left) as usize;
+    let crop_height = (intersection.bottom - intersection.top) as usize;
+    let mut data = vec![0u8; crop_width * crop_height * 4];
+    let src_x = (intersection.left - image_rect.left) as usize;
+    let src_y = (intersection.top - image_rect.top) as usize;
+    let src_width = image.width as usize;
+
+    if image.data.len() != src_width * image.height as usize * 4 {
+        return Err(anyhow!("冻结画面的像素数据大小不正确"));
+    }
+
+    for row in 0..crop_height {
+        let src_start = ((src_y + row) * src_width + src_x) * 4;
+        let dst_start = row * crop_width * 4;
+        let bytes = crop_width * 4;
+        data[dst_start..dst_start + bytes]
+            .copy_from_slice(&image.data[src_start..src_start + bytes]);
+    }
+
+    Ok(CapturedImage {
+        width: crop_width as u32,
+        height: crop_height as u32,
+        data,
+        is_hdr_source: image.is_hdr_source,
+    })
+}
+
+fn capture_region_from_monitors(rect: RECT, monitors: &[MonitorInfo]) -> Result<CapturedImage> {
+    let left = rect.left.min(rect.right);
+    let top = rect.top.min(rect.bottom);
+    let right = rect.left.max(rect.right);
+    let bottom = rect.top.max(rect.bottom);
+    let width = (right - left).max(0) as u32;
+    let height = (bottom - top).max(0) as u32;
+
+    if width == 0 || height == 0 {
+        return Err(anyhow!("截图区域为空"));
+    }
+
     let mut canvas = vec![0u8; width as usize * height as usize * 4];
     let mut touched = false;
     let mut hdr = false;
 
-    for monitor in &monitors {
+    for monitor in monitors {
         let monitor_rect = RECT {
             left: monitor.x,
             top: monitor.y,
@@ -69,8 +168,8 @@ pub fn capture_region(rect: RECT) -> Result<CapturedImage> {
             continue;
         };
 
-        let image =
-            capture_monitor(monitor).context(format!("截取显示器「{}」失败", monitor.name))?;
+        let image = capture_monitor_with_fallback(monitor)
+            .context(format!("截取显示器「{}」失败", monitor.name))?;
         hdr |= image.is_hdr_source;
 
         let copy_w = (intersection.right - intersection.left) as usize;
@@ -101,6 +200,160 @@ pub fn capture_region(rect: RECT) -> Result<CapturedImage> {
         data: canvas,
         is_hdr_source: hdr,
     })
+}
+
+fn capture_monitor_with_fallback(monitor: &MonitorInfo) -> Result<CapturedImage> {
+    let rect = monitor_rect(monitor);
+    match capture_monitor(monitor) {
+        Ok(image) if !is_probably_blank_frame(&image) => Ok(image),
+        Ok(image) => capture_region_gdi(rect).or(Ok(image)),
+        Err(dxgi_err) => {
+            capture_region_gdi(rect).with_context(|| format!("DXGI 截取显示器失败: {dxgi_err:#}"))
+        }
+    }
+}
+
+fn monitor_rect(monitor: &MonitorInfo) -> RECT {
+    RECT {
+        left: monitor.x,
+        top: monitor.y,
+        right: monitor.x + monitor.width as i32,
+        bottom: monitor.y + monitor.height as i32,
+    }
+}
+
+fn is_probably_blank_frame(image: &CapturedImage) -> bool {
+    if image.data.is_empty() {
+        return true;
+    }
+
+    let pixel_count = image.data.len() / 4;
+    if pixel_count == 0 {
+        return true;
+    }
+
+    let sample_count = pixel_count.min(4096);
+    let stride = (pixel_count / sample_count).max(1);
+    let mut sampled = 0usize;
+    let mut visible_pixels = 0usize;
+
+    for pixel_index in (0..pixel_count).step_by(stride) {
+        if sampled >= sample_count {
+            break;
+        }
+
+        let idx = pixel_index * 4;
+        let r = image.data[idx];
+        let g = image.data[idx + 1];
+        let b = image.data[idx + 2];
+        if r > 8 || g > 8 || b > 8 {
+            visible_pixels += 1;
+        }
+        sampled += 1;
+    }
+
+    // DXGI's startup black frame can still contain the cursor. Ignore tiny
+    // islands of non-black pixels so that the monitor under the mouse falls
+    // back to GDI instead of showing a black frozen screen.
+    visible_pixels * 1000 < sampled * 5
+}
+
+fn capture_region_gdi(rect: RECT) -> Result<CapturedImage> {
+    let rect = normalize_rect(rect);
+    let width = (rect.right - rect.left).max(0) as u32;
+    let height = (rect.bottom - rect.top).max(0) as u32;
+    if width == 0 || height == 0 {
+        return Err(anyhow!("截图区域为空"));
+    }
+
+    unsafe {
+        let screen_dc = GetDC(HWND::default());
+        if screen_dc.0.is_null() {
+            return Err(anyhow!("获取屏幕 DC 失败"));
+        }
+
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.0.is_null() {
+            let _ = ReleaseDC(HWND::default(), screen_dc);
+            return Err(anyhow!("创建内存 DC 失败"));
+        }
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: width * height * 4,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let bitmap = match CreateDIBSection(
+            screen_dc,
+            &mut bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            HANDLE::default(),
+            0,
+        ) {
+            Ok(bitmap) => bitmap,
+            Err(err) => {
+                let _ = DeleteDC(mem_dc);
+                let _ = ReleaseDC(HWND::default(), screen_dc);
+                return Err(err).context("创建 GDI 截图位图失败");
+            }
+        };
+
+        let old = SelectObject(mem_dc, bitmap);
+        let rop = ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0);
+        let blt_result = BitBlt(
+            mem_dc,
+            0,
+            0,
+            width as i32,
+            height as i32,
+            screen_dc,
+            rect.left,
+            rect.top,
+            rop,
+        );
+
+        let result = if blt_result.is_ok() {
+            let bgra = std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize);
+            Ok(CapturedImage {
+                width,
+                height,
+                data: bgra_to_rgba(bgra),
+                is_hdr_source: false,
+            })
+        } else {
+            Err(anyhow!("GDI BitBlt 截图失败"))
+        };
+
+        let _ = SelectObject(mem_dc, old);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(HWND::default(), screen_dc);
+        result
+    }
+}
+
+fn bgra_to_rgba(data: &[u8]) -> Vec<u8> {
+    let mut converted = Vec::with_capacity(data.len());
+    for pixel in data.chunks_exact(4) {
+        converted.push(pixel[2]);
+        converted.push(pixel[1]);
+        converted.push(pixel[0]);
+        converted.push(255);
+    }
+    converted
 }
 
 // ─── 常量 ───
@@ -203,6 +456,35 @@ fn intersect_rect(a: RECT, b: RECT) -> Option<RECT> {
             bottom,
         })
     }
+}
+
+fn normalize_rect(rect: RECT) -> RECT {
+    RECT {
+        left: rect.left.min(rect.right),
+        top: rect.top.min(rect.bottom),
+        right: rect.left.max(rect.right),
+        bottom: rect.top.max(rect.bottom),
+    }
+}
+
+fn virtual_desktop_bounds(monitors: &[MonitorInfo]) -> Option<RECT> {
+    let mut iter = monitors.iter();
+    let first = iter.next()?;
+    let mut bounds = RECT {
+        left: first.x,
+        top: first.y,
+        right: first.x + first.width as i32,
+        bottom: first.y + first.height as i32,
+    };
+
+    for monitor in iter {
+        bounds.left = bounds.left.min(monitor.x);
+        bounds.top = bounds.top.min(monitor.y);
+        bounds.right = bounds.right.max(monitor.x + monitor.width as i32);
+        bounds.bottom = bounds.bottom.max(monitor.y + monitor.height as i32);
+    }
+
+    Some(bounds)
 }
 
 /// 截取指定显示器
@@ -352,26 +634,19 @@ fn acquire_fresh_frame(
     let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
     let mut resource: Option<IDXGIResource> = None;
 
-    // 步骤1：丢弃 DuplicateOutput 时的初始缓冲帧（可能是空白帧）
-    let init_result = unsafe { duplication.AcquireNextFrame(0, &mut frame_info, &mut resource) };
-    if init_result.is_ok() {
-        unsafe { duplication.ReleaseFrame().ok() };
+    let mut result = unsafe { duplication.AcquireNextFrame(0, &mut frame_info, &mut resource) };
+    if let Err(err) = &result {
+        if err.code() == DXGI_ERROR_WAIT_TIMEOUT {
+            result = unsafe { duplication.AcquireNextFrame(35, &mut frame_info, &mut resource) };
+        }
     }
-
-    // 步骤2：等待真正的桌面帧更新
-    let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-    let mut resource: Option<IDXGIResource> = None;
-
-    let result = unsafe { duplication.AcquireNextFrame(1000, &mut frame_info, &mut resource) };
 
     match result {
         Ok(()) => {}
         Err(e) => {
             let code = e.code();
             if code == DXGI_ERROR_WAIT_TIMEOUT {
-                return Err(anyhow!(
-                    "获取桌面帧超时。请稍微移动鼠标或活动一下桌面后重试。"
-                ));
+                return Err(anyhow!("获取桌面帧超时"));
             }
             if code == DXGI_ERROR_ACCESS_LOST {
                 return Err(anyhow!(
@@ -379,23 +654,6 @@ fn acquire_fresh_frame(
                 ));
             }
             return Err(anyhow!("获取桌面帧失败: {}", e));
-        }
-    }
-
-    // 步骤3：丢弃积压帧，拿到最新画面
-    loop {
-        let mut next_info = DXGI_OUTDUPL_FRAME_INFO::default();
-        let mut next_resource: Option<IDXGIResource> = None;
-
-        let next_result =
-            unsafe { duplication.AcquireNextFrame(0, &mut next_info, &mut next_resource) };
-
-        if next_result.is_ok() {
-            unsafe { duplication.ReleaseFrame().ok() };
-            frame_info = next_info;
-            resource = next_resource;
-        } else {
-            break;
         }
     }
 
@@ -425,7 +683,7 @@ unsafe fn read_bgra8(
             data.push(*src.add(p + 2)); // R
             data.push(*src.add(p + 1)); // G
             data.push(*src.add(p)); // B
-            data.push(*src.add(p + 3)); // A
+            data.push(255); // Desktop duplication alpha is not reliable.
         }
     }
 
@@ -473,12 +731,11 @@ unsafe fn read_rgb10a2(
             let r = ((pixel & 0x3FF) as f32) / 1023.0;
             let g = (((pixel >> 10) & 0x3FF) as f32) / 1023.0;
             let b = (((pixel >> 20) & 0x3FF) as f32) / 1023.0;
-            let a = (((pixel >> 30) & 0x3) as f32) / 3.0;
 
             data.push(srgb_encode(r));
             data.push(srgb_encode(g));
             data.push(srgb_encode(b));
-            data.push((a * 255.0) as u8);
+            data.push(255);
         }
     }
 
