@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-const CLASS_NAME: windows::core::PCWSTR = w!("WysiwygScreenshotOverlay");
+const CLASS_NAME: windows::core::PCWSTR = w!("KumokiriOverlay");
 const HOTKEY_ENTER_ID: i32 = 701;
 const HOTKEY_ESCAPE_ID: i32 = 702;
 const HANDLE_SIZE: i32 = 8;

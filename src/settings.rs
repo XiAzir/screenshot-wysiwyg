@@ -27,6 +27,12 @@ impl Settings {
     pub fn load() -> Self {
         let mut settings = Settings::default();
         let path = config_path();
+        let legacy_path = legacy_config_path();
+        let path = if path.exists() || !legacy_path.exists() {
+            path
+        } else {
+            legacy_path
+        };
         let Ok(content) = fs::read_to_string(path) else {
             return settings;
         };
@@ -75,6 +81,13 @@ impl Settings {
 }
 
 pub fn config_path() -> PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    base.join("Kumokiri").join("settings.ini")
+}
+
+fn legacy_config_path() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));

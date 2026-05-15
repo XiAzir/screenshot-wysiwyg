@@ -39,12 +39,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
-const CLASS_NAME: PCWSTR = w!("WysiwygScreenshotMainWindow");
-const APP_NAME: PCWSTR = w!("所见即所得截图工具");
+const CLASS_NAME: PCWSTR = w!("KumokiriMainWindow");
+const APP_NAME: PCWSTR = w!("Kumokiri");
 const APP_ICON_ID: usize = 1;
 const HOTKEY_ID: i32 = 101;
 const TRAY_UID: u32 = 1;
 const WM_TRAYICON: u32 = WM_APP + 1;
+const AUTOSTART_NAME: &str = "Kumokiri";
+const LEGACY_AUTOSTART_NAME: &str = "WysiwygScreenshot";
 
 const IDC_SAVE_FILE: i32 = 1001;
 const IDC_SAVE_CLIPBOARD: i32 = 1002;
@@ -482,7 +484,7 @@ impl AppState {
             hIcon: icon,
             ..Default::default()
         };
-        copy_to_fixed_wide(&mut nid.szTip, "所见即所得截图工具");
+        copy_to_fixed_wide(&mut nid.szTip, "Kumokiri");
 
         unsafe {
             if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
@@ -798,7 +800,6 @@ unsafe fn set_window_icons(hwnd: HWND, hinstance: HINSTANCE) {
 
 fn autostart_enabled() -> bool {
     let subkey = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    let name = to_wide("WysiwygScreenshot");
     let mut key = HKEY::default();
     let opened = unsafe {
         RegOpenKeyExW(
@@ -812,9 +813,8 @@ fn autostart_enabled() -> bool {
     if opened != ERROR_SUCCESS {
         return false;
     }
-    let exists = unsafe {
-        RegQueryValueExW(key, PCWSTR(name.as_ptr()), None, None, None, None) == ERROR_SUCCESS
-    };
+    let exists = registry_value_exists(key, AUTOSTART_NAME)
+        || registry_value_exists(key, LEGACY_AUTOSTART_NAME);
     unsafe {
         let _ = RegCloseKey(key);
     }
@@ -823,7 +823,7 @@ fn autostart_enabled() -> bool {
 
 fn set_autostart(enabled: bool) -> Result<()> {
     let subkey = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    let name = to_wide("WysiwygScreenshot");
+    let name = to_wide(AUTOSTART_NAME);
     let mut key = HKEY::default();
     let result = unsafe {
         RegCreateKeyExW(
@@ -848,13 +848,16 @@ fn set_autostart(enabled: bool) -> Result<()> {
         let command = to_wide(&command);
         let bytes =
             unsafe { std::slice::from_raw_parts(command.as_ptr() as *const u8, command.len() * 2) };
-        unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(bytes)) }
+        let result = unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(bytes)) };
+        let _ = delete_registry_value(key, LEGACY_AUTOSTART_NAME);
+        result
     } else {
-        let deleted = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
-        if deleted == ERROR_FILE_NOT_FOUND {
-            ERROR_SUCCESS
+        let deleted_current = delete_registry_value(key, AUTOSTART_NAME);
+        let deleted_legacy = delete_registry_value(key, LEGACY_AUTOSTART_NAME);
+        if deleted_current == ERROR_SUCCESS {
+            deleted_current
         } else {
-            deleted
+            deleted_legacy
         }
     };
 
@@ -867,4 +870,19 @@ fn set_autostart(enabled: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn registry_value_exists(key: HKEY, name: &str) -> bool {
+    let name = to_wide(name);
+    unsafe { RegQueryValueExW(key, PCWSTR(name.as_ptr()), None, None, None, None) == ERROR_SUCCESS }
+}
+
+fn delete_registry_value(key: HKEY, name: &str) -> windows::Win32::Foundation::WIN32_ERROR {
+    let name = to_wide(name);
+    let deleted = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
+    if deleted == ERROR_FILE_NOT_FOUND {
+        ERROR_SUCCESS
+    } else {
+        deleted
+    }
 }

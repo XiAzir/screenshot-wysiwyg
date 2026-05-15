@@ -4,23 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-WYSIWYG 截图工具，基于 Windows Desktop Duplication API 直接从显卡输出缓冲区捕获画面，规避 QQ/游戏截图的质量损失。
+Kumokiri 截图工具，基于 Windows Desktop Duplication API 直接从显卡输出缓冲区捕获画面，规避 QQ/游戏截图的质量损失。
 
 ## 构建与运行
 
 ```powershell
 cargo build --release          # 编译 release（无调试符号）
 cargo build                    # 编译 debug
-cargo build --release -p screenshot-wysiwyg  # 仅编主包
+cargo build --release -p kumokiri  # 仅编主包
 ```
 
-编译产物: `target/release/screenshot-wysiwyg.exe` (~890KB)
+编译产物: `target/release/Kumokiri.exe`
 
 测试截图:
 ```powershell
-.\screenshot-wysiwyg.exe -l                    # 列出显示器
-.\screenshot-wysiwyg.exe -o shot.png           # 截主显示器
-.\screenshot-wysiwyg.exe --daemon              # 热键后台（Ctrl+Alt+B）
+.\Kumokiri.exe
 ```
 
 ## 架构

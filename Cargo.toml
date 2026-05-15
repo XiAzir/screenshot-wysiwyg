@@ -1,8 +1,12 @@
 [package]
-name = "screenshot-wysiwyg"
+name = "kumokiri"
 version = "0.1.1"
 edition = "2021"
-description = "WYSIWYG screenshot tool using Windows Desktop Duplication API"
+description = "Kumokiri screenshot tool using Windows Desktop Duplication API"
+
+[[bin]]
+name = "Kumokiri"
+path = "src/main.rs"
 
 [dependencies]
 windows = { version = "0.58", features = [
