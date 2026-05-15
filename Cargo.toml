@@ -1,6 +1,6 @@
 [package]
 name = "screenshot-wysiwyg"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "WYSIWYG screenshot tool using Windows Desktop Duplication API"
 
